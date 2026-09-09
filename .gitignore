@@ -1,0 +1,5 @@
+minidb
+data/
+*.log
+*.o
+*.tmp
