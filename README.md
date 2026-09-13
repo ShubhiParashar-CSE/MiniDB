@@ -1,98 +1,157 @@
 # MiniDB
 
-A persistent, multi-threaded, network-accessible key-value store written in
-C++20 from scratch (raw POSIX sockets, no external libraries).
+MiniDB is a lightweight, persistent key-value database built in C++20 from scratch. It mimics the core ideas of a small Redis-like server: TCP client access, in-memory storage, TTL support, durable writes, and background maintenance.
 
-Think "a tiny Redis": clients connect over TCP, send text commands, get
-text responses, and data survives restarts and crashes.
+The project is designed as a practical systems programming exercise and demonstrates how a real database can combine:
+
+- a thread-safe in-memory store
+- a WAL-based persistence layer
+- periodic snapshot compaction
+- a bounded thread pool
+- a simple text-based command protocol over TCP
 
 ## Features
 
-- `SET key value`, `GET key`, `DEL key`, `EXISTS key`, `EXPIRE key seconds`, `PING`
-- Thread-safe in-memory store (readers-writer lock, not a single global mutex)
-- **Durability**: every write is logged to disk (Write-Ahead Log) before being
-  acknowledged, so a crash right after a write doesn't lose it
-- **Compaction**: state is periodically snapshotted to disk and the WAL is
-  truncated, so the log doesn't grow forever
-- **TTL/expiry**: lazy expiry on read + a background sweep thread
-- **Concurrency**: fixed-size thread pool handles client connections
-  (bounded resource use, no thread-per-connection explosion)
+- `SET key value`
+- `GET key`
+- `DEL key`
+- `EXISTS key`
+- `EXPIRE key seconds`
+- `PING`
+- Time-to-live (TTL) expiration support
+- Thread-safe concurrent reads and writes
+- Crash recovery with WAL replay
+- Snapshot compaction to keep persistence efficient
+- Fixed-size worker thread pool for client handling
 
-## Build & run
+## Project Structure
 
+```text
+.
+├── Makefile
+├── README.md
+├── test.sh
+├── data/
+│   ├── snapshot.db
+│   └── wal.log
+├── include/
+│   ├── kvstore.hpp
+│   ├── persistence.hpp
+│   ├── protocol.hpp
+│   ├── server.hpp
+│   └── threadpool.hpp
+└── src/
+    └── main.cpp
 ```
+
+## How It Works
+
+### 1. Storage engine
+The `KVStore` class stores key-value entries in an unordered map with a `std::shared_mutex` for safe concurrent access. This allows many reads to proceed in parallel while writes remain exclusive.
+
+### 2. Persistence
+Each mutating operation is written to a Write-Ahead Log (`data/wal.log`) before acknowledgment. On startup, the database loads the last snapshot and replays the WAL to restore state.
+
+### 3. Compaction
+The persistence layer periodically creates a snapshot of the current state and truncates the WAL. This prevents the log from growing indefinitely and reduces recovery time after restarts.
+
+### 4. Networking
+The server listens on a TCP port and accepts client connections. Each connection is processed by a worker in a bounded thread pool, which avoids the overhead of a thread-per-connection model.
+
+### 5. Command protocol
+Clients talk to the server using plain text commands terminated by newline characters. The parser interprets commands like `SET`, `GET`, `DEL`, and `EXPIRE` and returns responses in text format.
+
+## Build and Run
+
+Clone the repository and build it:
+
+```bash
 make
+```
+
+Start the server:
+
+```bash
 ./minidb 6380
 ```
 
-Then from another terminal:
-```
-bash test.sh   # runs a full demo including a simulated crash + recovery
+You can also run the end-to-end durability demo:
+
+```bash
+bash test.sh
 ```
 
-Or talk to it directly with netcat / telnet:
-```
+This script starts the server, writes keys, simulates a hard crash, restarts the service, and verifies that data survives the restart.
+
+## Example Usage
+
+Using `nc` or `telnet`:
+
+```bash
 nc localhost 6380
-SET foo bar
-GET foo
 ```
 
-## Architecture
+Then send commands:
 
+```text
+SET name minidb
+GET name
+EXISTS name
+EXPIRE name 30
+DEL name
+PING
 ```
-include/threadpool.hpp   fixed worker-thread pool + task queue
-include/kvstore.hpp       the storage engine (hash map + shared_mutex + TTL)
-include/persistence.hpp   Write-Ahead Log + snapshot/compaction
-include/protocol.hpp      parses text commands, calls store + persistence
-include/server.hpp        TCP accept loop, dispatches to thread pool
-src/main.cpp               wiring + background maintenance thread
+
+Example responses:
+
+```text
++OK
+minidb
++1
++OK
++PONG
 ```
 
-Request flow for a `SET`:
-1. `Server` accepts the connection, hands it to a `ThreadPool` worker
-2. Worker reads a line, `Protocol::handleLine` parses it
-3. `KVStore::set` updates the in-memory map (under a write lock)
-4. `Persistence::logSet` appends the command to `data/wal.log` and flushes
-5. `+OK\r\n` is sent back to the client
+## Architecture Overview
 
-Startup flow:
-1. Load `data/snapshot.db` (last compacted full state) into the store
-2. Replay `data/wal.log` (writes since that snapshot) on top of it
-3. Start accepting connections
+```text
+Client --> TCP Server --> ThreadPool --> Protocol Parser --> KVStore
+                                             |
+                                             +--> Persistence Layer
+                                                    (WAL + Snapshot)
+```
 
-## Design decisions worth discussing in an interview
+## Design Notes
 
-- **shared_mutex over a plain mutex**: reads (GET) can run concurrently;
-  writes (SET/DEL/EXPIRE) get exclusive access. Trade-off: more overhead
-  per-lock than a plain mutex, so it only wins when reads dominate and
-  there's real multi-core contention.
-- **WAL + snapshot instead of writing full state on every change**: O(1)
-  append per write instead of O(n) full rewrite. The snapshot bounds how
-  much WAL ever needs replaying on startup.
-- **fsync/flush on every WAL write**: durability over raw throughput. A
-  production system might batch/group commits for higher throughput at
-  the cost of a small durability window — a deliberate trade-off, not an
-  oversight.
-- **Thread pool over thread-per-connection**: bounded resource usage.
-  Trade-off: connections can queue if all workers are busy, whereas
-  thread-per-connection never queues (but can exhaust the OS under load).
-- **Text protocol over binary**: easy to debug with `nc`/`telnet`, easy to
-  parse. Known limitation: values can't contain raw spaces, since parsing
-  splits on whitespace. A real protocol (like Redis's RESP) length-prefixes
-  each argument to avoid this.
+- `shared_mutex` is used instead of a single global mutex to improve read concurrency.
+- WAL writes are flushed immediately for stronger durability guarantees.
+- Snapshot compaction keeps the recovery path fast and bounded.
+- The threaded server avoids resource exhaustion while still handling multiple clients.
 
-## Known limitations (good to name proactively in an interview)
+## Limitations
 
-- Single-node only, no replication
-- No authentication/encryption
-- Values can't contain spaces (protocol limitation, not engine limitation)
-- No crash-safety for a torn/partial WAL line during an actual power-loss
-  mid-write (a real system would checksum each WAL entry)
-- Compaction and reaping run on a timer, not adaptively under memory pressure
+This is a learning-focused implementation and intentionally keeps the scope narrow. Some limitations include:
 
-## Natural next steps (if asked "what would you add next?")
+- single-node deployment only
+- no auth or encryption
+- no replication
+- values are restricted by the simple text protocol format
+- storage is not optimized for huge-scale production workloads
 
-- Switch the accept loop to `epoll` for higher connection scalability
-- RESP-style length-prefixed protocol to support binary-safe values
-- LRU eviction policy when memory is capped
-- A simple client library / CLI tool
+## Future Improvements
+
+Possible next steps include:
+
+- `epoll`/non-blocking I/O for higher scalability
+- RESP-style binary-safe protocol support
+- LRU eviction or memory caps
+- stronger WAL checksums and corruption recovery
+- a lightweight CLI client
+
+## License
+
+This project is intended for educational and personal development use.
+
+## Author
+
+Shubhi Parashar
